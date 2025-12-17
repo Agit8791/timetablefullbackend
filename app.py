@@ -811,5 +811,6 @@ def get_conflicts(session_id):
         return jsonify({'error': 'Session not found'}), 404
     return jsonify({'success': True, 'conflicts': timetables[session_id].get('conflicts', [])})
 
-if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+if __name__ == "__main__":
+    # Remove debug=True and port=5000
+    app.run(host="0.0.0.0")
