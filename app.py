@@ -1,5 +1,5 @@
 from flask import Flask, render_template, request, jsonify, send_file
-from flask_cors import CORS  # <-- enable CORS
+from flask_cors import CORS  # Added for Vercel cross-origin
 from datetime import datetime
 import io
 from openpyxl import Workbook
@@ -11,12 +11,50 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.lib.units import inch
 import random
+import os  # Added for Railway port
 
-# ------------------------
-# Flask App Setup
-# ------------------------
+def sort_time_slots(slots):
+    """Sort time slots chronologically using 12h-to-24h conversion with AM/PM awareness"""
+    def get_sort_key(slot_str):
+        try:
+            # Extract start time using common separators
+            start_part = slot_str
+            for sep in ['–', '—', '-']:
+                if sep in slot_str:
+                    start_part = slot_str.split(sep)[0].strip()
+                    break
+            
+            # Check for AM/PM markers
+            time_upper = start_part.upper()
+            is_pm = 'PM' in time_upper or 'P.M.' in time_upper
+            is_am = 'AM' in time_upper or 'A.M.' in time_upper
+            
+            # Parse HH:MM (get just the time part, removing AM/PM)
+            time_part = start_part.split()[0]
+            if ':' in time_part:
+                h, m = map(int, time_part.split(':'))
+            else:
+                h, m = int(time_part), 0
+            
+            # Convert 12-hour to 24-hour format
+            if is_pm:
+                if h != 12:
+                    h += 12
+            elif is_am:
+                if h == 12:
+                    h = 0
+            elif 1 <= h < 7:
+                # Heuristic: hours 1-6 are likely PM in a school context
+                h += 12
+            
+            return h * 60 + m
+        except:
+            return 0
+    
+    return sorted(list(set(slots)), key=get_sort_key)
+
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # Added to allow Vercel frontend
 
 # In-memory storage
 timetables = {}
@@ -33,8 +71,6 @@ class TimetableGenerator:
         self.semesters = semesters
         self.timetable = []
         self.conflicts = []
-        
-
         
     def _subject_color(self, name: str) -> str:
         # Deterministic HSL pastel color from subject name
@@ -79,22 +115,36 @@ class TimetableGenerator:
             classroom: {day: {slot: False for slot in slots_order} for day in days_order}
             for classroom in self.classrooms
         }
-        # cohort schedule by semester
+        # cohort schedule by semester: stores what subject is scheduled in each slot
         cohort_schedule = {
-            semester: {day: {slot: False for slot in slots_order} for day in days_order}
+            semester: {day: {slot: None for slot in slots_order} for day in days_order}
             for semester in (set([s.get('semester', 'General') for s in self.subjects]) or {'General'})
         }
         # cohort daily load counts
         cohort_load = {}
 
         def can_place(subject, teacher, classroom, day, slot):
+            # Check if slot is the break slot (handle different separators)
+            is_break = False
+            for sep in ['–', '—', '-']:
+                if sep in slot:
+                    parts = slot.split(sep)
+                    if len(parts) >= 2 and parts[0].strip() == "11:30" and parts[1].strip().startswith("01:00"):
+                        is_break = True
+                        break
+            if is_break:
+                return False
             semester = subject.get('semester', 'General')
             if teacher_schedule.get(teacher['name'], {}).get(day, {}).get(slot):
                 return False
             if classroom_schedule.get(classroom, {}).get(day, {}).get(slot):
                 return False
-            if cohort_schedule.get(semester, {}).get(day, {}).get(slot):
+            
+            # Cohort check: Allow if slot is empty OR already has the SAME subject (multiple teachers for same subject)
+            existing_subject = cohort_schedule.get(semester, {}).get(day, {}).get(slot)
+            if existing_subject is not None and existing_subject != subject['name']:
                 return False
+            
             if not self.is_teacher_available(teacher, day, slot):
                 return False
             return True
@@ -143,9 +193,12 @@ class TimetableGenerator:
             self.timetable.append(entry)
             teacher_schedule[teacher['name']][day][slot] = True
             classroom_schedule[classroom][day][slot] = True
-            cohort_schedule[semester][day][slot] = True
-            cohort_load.setdefault(semester, {}).setdefault(day, 0)
-            cohort_load[semester][day] += 1
+            
+            # Update cohort only if not already set (to handle multiple teachers for same subject)
+            if cohort_schedule[semester][day][slot] is None:
+                cohort_schedule[semester][day][slot] = subject['name']
+                cohort_load.setdefault(semester, {}).setdefault(day, 0)
+                cohort_load[semester][day] += 1
 
         def rank_slots_for_semester(semester):
             ranked = []
@@ -165,6 +218,14 @@ class TimetableGenerator:
             teachers_for_subject = subject_to_teachers.get(subject_key, [])
             if not teachers_for_subject:
                 return []
+            
+            # If a specific teacher is assigned to this subject-department combo, filter to that teacher
+            assigned_teacher_id = subject.get('teacher_id')
+            if assigned_teacher_id:
+                teachers_for_subject = [t for t in teachers_for_subject if t.get('name') == assigned_teacher_id]
+                if not teachers_for_subject:
+                    return []
+            
             candidates = []
             for day, slot in rank_slots_for_semester(semester):
                 for t in teachers_for_subject:
@@ -232,13 +293,14 @@ class TimetableGenerator:
                                                    for t in teachers_for_subject)
                             any_class_free = any(not classroom_schedule[c][day][slot] for c in self.classrooms)
                             semester = subject.get('semester', 'General')
-                            cohort_busy = cohort_schedule[semester][day][slot]
+                            existing_subject = cohort_schedule[semester][day][slot]
+                            cohort_busy = (existing_subject is not None and existing_subject != subject['name'])
                             if not any_teacher_free:
                                 reasons.append(f"No available teacher at {day} {slot}")
                             if not any_class_free:
                                 reasons.append(f"No available classroom at {day} {slot}")
                             if cohort_busy:
-                                reasons.append(f"Semester busy at {day} {slot}")
+                                reasons.append(f"Semester busy with {existing_subject} at {day} {slot}")
                     # Deduplicate reasons
                     seen = set()
                     reasons = [r for r in reasons if not (r in seen or seen.add(r))]
@@ -248,7 +310,8 @@ class TimetableGenerator:
                 for day in days_order:
                     for slot in slots_order:
                         semester = subject.get('semester', 'General')
-                        if cohort_schedule[semester][day][slot]:
+                        existing_subject = cohort_schedule[semester][day][slot]
+                        if existing_subject is not None and existing_subject != subject['name']:
                             continue
                         # gather teachers and classrooms free
                         free_teachers = [t for t in teachers_for_subject if self.is_teacher_available(t, day, slot) and not teacher_schedule[t['name']][day][slot]]
@@ -274,13 +337,13 @@ class TimetableGenerator:
         # Detect conflicts after placement for safety
         self.detect_conflicts()
 
-        # Post-generation validation: ensure each subject appears required number of times
+        # Post-generation validation: ensure each subject-teacher combo appears required number of times
         occurrences = {}
         for e in self.timetable:
-            occurrences[(e['subject'], e.get('semester', 'General'))] = occurrences.get((e['subject'], e.get('semester', 'General')), 0) + 1
+            occurrences[(e['subject'], e.get('semester', 'General'), e['teacher'])] = occurrences.get((e['subject'], e.get('semester', 'General'), e['teacher']), 0) + 1
         for subject in self.subjects:
             sessions_required = int(subject.get('sessions_per_week', 2) or 0)
-            key = (subject['name'], subject.get('semester', 'General'))
+            key = (subject['name'], subject.get('semester', 'General'), subject.get('teacher_name'))
             count = occurrences.get(key, 0)
             if count < sessions_required:
                 missing = sessions_required - count
@@ -320,6 +383,17 @@ class TimetableGenerator:
             indexed.setdefault(key, []).append(e)
 
         for (day, slot), entries in indexed.items():
+            # Skip break slot entirely - no classes should be scheduled here (handle different separators)
+            is_break = False
+            for sep in ['–', '—', '-']:
+                if sep in slot:
+                    parts = slot.split(sep)
+                    if len(parts) >= 2 and parts[0].strip() == "11:30" and parts[1].strip().startswith("01:00"):
+                        is_break = True
+                        break
+            if is_break:
+                continue
+            
             # teacher conflicts
             teacher_map = {}
             classroom_map = {}
@@ -343,10 +417,13 @@ class TimetableGenerator:
                         'subjects': [x['subject'] for x in arr]
                     })
             for cohort, arr in cohort_map.items():
-                if len(arr) > 1:
+                # Student conflict if multiple DIFFERENT subjects are in same slot for same semester
+                # If it's same subject with different teachers/classrooms, it's allowed (grouped session)
+                unique_subjects = set(x['subject'] for x in arr)
+                if len(unique_subjects) > 1:
                     conflicts.append({
                         'type': 'student', 'semester': cohort, 'day': day, 'time_slot': slot,
-                        'subjects': [x['subject'] for x in arr]
+                        'subjects': list(unique_subjects)
                     })
         self.conflicts.extend(conflicts)
 
@@ -368,12 +445,28 @@ def generate_timetable():
         subjects = data.get('subjects', memory.get('subjects', []))
         classrooms = data.get('classrooms', memory.get('classrooms', []))
         time_slots = data.get('timeSlots', memory.get('timeSlots', []))
+        
+        # Ensure mandatory break slot is present and sort slots
+        BREAK_SLOT = "11:30 – 01:00"
+        if BREAK_SLOT not in time_slots:
+            time_slots.append(BREAK_SLOT)
+        time_slots = sort_time_slots(time_slots)
+
         days = data.get('days', memory.get('days', []))
         semesters = data.get('semesters', memory.get('semesters', []))
         preferences = data.get('preferences', memory.get('preferences', {}))
         
         if not all([teachers, subjects, classrooms, time_slots, days]):
             return jsonify({'error': 'Missing required data'}), 400
+        
+        # Validate duplicate teachers
+        teacher_names = [t.get('name', '').strip().lower() for t in teachers]
+        if len(teacher_names) != len(set(teacher_names)):
+             return jsonify({'error': 'Duplicate teachers detected. Please ensure each teacher is unique.'}), 400
+
+        # Validate duplicate time slots
+        if len(time_slots) != len(set(time_slots)):
+             return jsonify({'error': 'Duplicate time slots detected. Please ensure each time slot is unique.'}), 400
         
         generator = TimetableGenerator(teachers, subjects, classrooms, time_slots, days, semesters)
         result = generator.generate()
@@ -547,15 +640,29 @@ def export_excel(session_id):
             cell.border = thin_border
 
         # Fill data: for each day and slot, list all classroom entries combined
-        for row, day in enumerate(days, start=3):
-            day_cell = ws.cell(row=row, column=1)
+        for row_idx, day in enumerate(days, start=3):
+            day_cell = ws.cell(row=row_idx, column=1)
             day_cell.value = day
             day_cell.fill = day_fill
             day_cell.font = day_font
             day_cell.alignment = Alignment(horizontal='center', vertical='center')
             day_cell.border = thin_border
 
-            for col, slot in enumerate(time_slots, start=2):
+            for col_idx, slot in enumerate(time_slots, start=2):
+                cell = ws.cell(row=row_idx, column=col_idx)
+                if slot == "11:30 – 01:00":
+                    if row_idx == 3: # First day
+                        cell.value = "BREAK"
+                        cell.fill = break_fill
+                        cell.font = break_font
+                        # Vertical alignment and wrap text for vertical "BREAK" effect in Excel
+                        cell.alignment = Alignment(horizontal='center', vertical='center', textRotation=255)
+                        cell.border = thin_border
+                        
+                        # Merge vertically across all days
+                        ws.merge_cells(start_row=3, start_column=col_idx, end_row=3 + len(days) - 1, end_column=col_idx)
+                    continue
+
                 # Collect entries for all classrooms at this day/slot
                 entries = [
                     e for e in timetable_data
@@ -670,6 +777,9 @@ def export_pdf(session_id):
         for day in days:
             row = [day]
             for slot in time_slots:
+                if slot == "11:30 – 01:00":
+                    row.append("BREAK")
+                    continue
                 entries = [e for e in timetable_data if e['day'] == day and e['time_slot'] == slot]
                 if entries:
                     # Build visually separated entries using themed bullet separators
@@ -739,9 +849,24 @@ def export_pdf(session_id):
             if r % 2 == 0:
                 style_list.append(('BACKGROUND', (1, r), (-1, r), zebra_bg))
 
+        # Identify break slot column for merging
+        break_col_idx = -1
+        for idx, slot in enumerate(time_slots):
+            if slot == "11:30 – 01:00":
+                break_col_idx = idx + 1 # +1 for Day column
+                break
+
         # Per-cell subject color is not trivial in a combined multi-entry cell; keep readable base and subtle highlight if any entries exist
         for row_idx, day in enumerate(days, start=1):
             for col_idx, slot in enumerate(time_slots, start=1):
+                if slot == "11:30 – 01:00":
+                    if row_idx == 1: # First row (Monday)
+                        style_list.append(('SPAN', (col_idx, 1), (col_idx, -1)))
+                        style_list.append(('BACKGROUND', (col_idx, 1), (col_idx, -1), colors.HexColor('#FFF3CD')))
+                        style_list.append(('TEXTCOLOR', (col_idx, 1), (col_idx, -1), colors.HexColor('#856404')))
+                        style_list.append(('FONTNAME', (col_idx, 1), (col_idx, -1), 'Helvetica-Bold'))
+                        style_list.append(('FONTSIZE', (col_idx, 1), (col_idx, -1), 14))
+                    continue
                 has_any = any(e for e in timetable_data if e['day'] == day and e['time_slot'] == slot)
                 if has_any:
                     style_list.append(('BACKGROUND', (col_idx, row_idx), (col_idx, row_idx), colors.HexColor('#E8F5E9')))
@@ -816,10 +941,6 @@ def get_conflicts(session_id):
         return jsonify({'error': 'Session not found'}), 404
     return jsonify({'success': True, 'conflicts': timetables[session_id].get('conflicts', [])})
 
-if __name__ == "__main__":
-    # Remove debug=True and port
-    # Railway sets port automatically via $PORT environment variable
-    import os
+if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
